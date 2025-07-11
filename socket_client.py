@@ -1,8 +1,10 @@
 import socket
 import tkinter as tk
-from tkinter import scrolledtext, messagebox
+from tkinter import scrolledtext, messagebox, filedialog
 import threading
 import datetime
+import os
+import struct
 
 class SocketClientGUI:
     def __init__(self, master):
@@ -20,7 +22,7 @@ class SocketClientGUI:
         self.host_label.grid(row=0, column=0, padx=5, pady=5, sticky="w")
         self.host_entry = tk.Entry(master, width=30)
         self.host_entry.grid(row=0, column=1, padx=5, pady=5)
-        self.host_entry.insert(0, "10.192.27.22") # 默认地址
+        self.host_entry.insert(0, "127.0.0.1") # 默认地址
 
         self.port_label = tk.Label(master, text="端口号:")
         self.port_label.grid(row=1, column=0, padx=5, pady=5, sticky="w")
@@ -28,9 +30,21 @@ class SocketClientGUI:
         self.port_entry.grid(row=1, column=1, padx=5, pady=5)
         self.port_entry.insert(0, "8888") # 默认端口
 
+        # 编码格式选择
+        self.encoding_label = tk.Label(master, text="编码格式:")
+        self.encoding_label.grid(row=2, column=0, padx=5, pady=5, sticky="w")
+        self.encoding_var = tk.StringVar(value="utf-8")
+        encoding_frame = tk.Frame(master)
+        encoding_frame.grid(row=2, column=1, padx=5, pady=5, sticky="w")
+        
+        encodings = ["utf-8", "gbk", "gb2312", "ascii", "latin-1"]
+        for i, encoding in enumerate(encodings):
+            rb = tk.Radiobutton(encoding_frame, text=encoding, variable=self.encoding_var, value=encoding)
+            rb.pack(side=tk.LEFT, padx=5)
+
         # 连接和断开按钮框架
         button_frame = tk.Frame(master)
-        button_frame.grid(row=2, column=0, columnspan=2, pady=10)
+        button_frame.grid(row=3, column=0, columnspan=2, pady=10)
         
         self.connect_button = tk.Button(button_frame, text="连接服务器", command=self.connect_to_server)
         self.connect_button.pack(side=tk.LEFT, padx=5)
@@ -40,30 +54,56 @@ class SocketClientGUI:
 
         # 发送区域
         self.send_label = tk.Label(master, text="要发送的内容:")
-        self.send_label.grid(row=3, column=0, padx=5, pady=5, sticky="nw")
+        self.send_label.grid(row=4, column=0, padx=5, pady=5, sticky="nw")
+        
+        # 发送模式选择
+        send_mode_frame = tk.Frame(master)
+        send_mode_frame.grid(row=4, column=1, padx=5, pady=2, sticky="w")
+        
+        self.send_mode_var = tk.StringVar(value="text")
+        text_rb = tk.Radiobutton(send_mode_frame, text="文本消息", variable=self.send_mode_var, 
+                                value="text", command=self.on_send_mode_change)
+        text_rb.pack(side=tk.LEFT, padx=5)
+        
+        file_rb = tk.Radiobutton(send_mode_frame, text="文件传输", variable=self.send_mode_var, 
+                                value="file", command=self.on_send_mode_change)
+        file_rb.pack(side=tk.LEFT, padx=5)
+        
+        # 文件选择框架（初始隐藏）
+        self.file_frame = tk.Frame(master)
+        self.file_frame.grid(row=5, column=1, padx=5, pady=2, sticky="ew")
+        self.file_frame.grid_remove()  # 初始隐藏
+        
+        self.file_path_var = tk.StringVar()
+        self.file_entry = tk.Entry(self.file_frame, textvariable=self.file_path_var, width=50)
+        self.file_entry.pack(side=tk.LEFT, padx=2)
+        
+        self.file_browse_button = tk.Button(self.file_frame, text="浏览...", command=self.browse_file)
+        self.file_browse_button.pack(side=tk.LEFT, padx=2)
+        
         self.send_text = scrolledtext.ScrolledText(master, width=60, height=10, wrap=tk.WORD)
-        self.send_text.grid(row=3, column=1, padx=5, pady=5, sticky="nsew")
+        self.send_text.grid(row=6, column=1, padx=5, pady=5, sticky="nsew")
 
         # 绑定回车键发送
         self.send_text.bind('<Control-Return>', lambda event: self.send_message())
         self.send_button = tk.Button(master, text="发送 (Ctrl+Enter)", command=self.send_message, state=tk.DISABLED)
-        self.send_button.grid(row=4, column=1, pady=5, sticky="e")
+        self.send_button.grid(row=7, column=1, pady=5, sticky="e")
         
         # 接收消息区域
         self.receive_label = tk.Label(master, text="接收的消息:")
-        self.receive_label.grid(row=5, column=0, padx=5, pady=5, sticky="nw")
+        self.receive_label.grid(row=8, column=0, padx=5, pady=5, sticky="nw")
         self.receive_text = scrolledtext.ScrolledText(master, width=60, height=8, state=tk.DISABLED, wrap=tk.WORD)
-        self.receive_text.grid(row=5, column=1, padx=5, pady=5, sticky="nsew")
+        self.receive_text.grid(row=8, column=1, padx=5, pady=5, sticky="nsew")
         
         # 状态区域
         self.status_label = tk.Label(master, text="状态信息:")
-        self.status_label.grid(row=6, column=0, padx=5, pady=5, sticky="nw")
+        self.status_label.grid(row=9, column=0, padx=5, pady=5, sticky="nw")
         self.status_text = scrolledtext.ScrolledText(master, width=60, height=5, state=tk.DISABLED, wrap=tk.WORD)
-        self.status_text.grid(row=6, column=1, padx=5, pady=5, sticky="nsew")
+        self.status_text.grid(row=9, column=1, padx=5, pady=5, sticky="nsew")
 
         # 清空按钮框架
         clear_frame = tk.Frame(master)
-        clear_frame.grid(row=7, column=1, pady=5, sticky="e")
+        clear_frame.grid(row=10, column=1, pady=5, sticky="e")
         
         self.clear_receive_button = tk.Button(clear_frame, text="清空接收", command=self.clear_receive_area)
         self.clear_receive_button.pack(side=tk.LEFT, padx=2)
@@ -73,13 +113,13 @@ class SocketClientGUI:
 
         # 退出按钮
         self.exit_button = tk.Button(master, text="退出", command=self.on_closing)
-        self.exit_button.grid(row=8, column=0, columnspan=2, pady=10)
+        self.exit_button.grid(row=11, column=0, columnspan=2, pady=10)
 
         # 配置网格权重，使界面可以调整大小
         master.columnconfigure(1, weight=1)
-        master.rowconfigure(3, weight=2)  # 发送区域
-        master.rowconfigure(5, weight=1)  # 接收区域
-        master.rowconfigure(6, weight=1)  # 状态区域
+        master.rowconfigure(6, weight=2)  # 发送区域
+        master.rowconfigure(8, weight=1)  # 接收区域
+        master.rowconfigure(9, weight=1)  # 状态区域
 
         master.protocol("WM_DELETE_WINDOW", self.on_closing) # 窗口关闭协议
 
@@ -203,7 +243,13 @@ class SocketClientGUI:
                     self.master.after(0, lambda: self._on_connection_lost("服务器关闭了连接"))
                     break
                     
-                message = data.decode('utf-8', errors='ignore')
+                encoding = self.encoding_var.get()
+                try:
+                    message = data.decode(encoding)
+                except UnicodeDecodeError:
+                    # 如果解码失败，尝试用utf-8，并显示错误信息
+                    message = data.decode('utf-8', errors='replace')
+                    self.master.after(0, lambda: self.update_status(f"解码失败，使用UTF-8解码 (原编码: {encoding})"))
                 # 在主线程中更新UI
                 self.master.after(0, lambda msg=message: self.update_receive_area(msg))
                 
@@ -232,6 +278,21 @@ class SocketClientGUI:
             messagebox.showerror("错误", "请先连接到服务器！")
             return
 
+        # 检查发送模式
+        if self.send_mode_var.get() == "file":
+            # 文件发送模式
+            file_path = self.file_path_var.get().strip()
+            if not file_path:
+                self.update_status("请选择要发送的文件。")
+                messagebox.showerror("错误", "请选择要发送的文件！")
+                return
+            
+            # 发送文件
+            if self.send_file(file_path):
+                self.file_path_var.set("")  # 清空文件路径
+            return
+        
+        # 文本发送模式
         message = self.send_text.get(1.0, tk.END).strip() # 获取所有内容并去除首尾空白
 
         if not message:
@@ -244,9 +305,17 @@ class SocketClientGUI:
         #         return
 
         try:
-            self.client_socket.sendall(message.encode('utf-8'))
+            encoding = self.encoding_var.get()
+            try:
+                encoded_message = message.encode(encoding)
+            except UnicodeEncodeError as e:
+                self.update_status(f"编码失败：无法使用 {encoding} 编码此消息")
+                messagebox.showerror("编码错误", f"无法使用 {encoding} 编码此消息。\n错误：{e}")
+                return
+                
+            self.client_socket.sendall(encoded_message)
             timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-            self.update_status(f"消息已发送")
+            self.update_status(f"消息已发送 (编码: {encoding})")
             
             # 在接收区域显示发送的消息
             self.receive_text.config(state=tk.NORMAL)
@@ -269,6 +338,85 @@ class SocketClientGUI:
             self.disconnect_from_server()
         except Exception as e:
             self.update_status(f"发送时发生错误：{e}")
+
+    def on_send_mode_change(self):
+        """处理发送模式改变"""
+        if self.send_mode_var.get() == "file":
+            self.file_frame.grid()  # 显示文件选择框架
+            self.send_text.config(state=tk.DISABLED)  # 禁用文本输入框
+            self.send_button.config(text="发送文件")
+        else:
+            self.file_frame.grid_remove()  # 隐藏文件选择框架
+            self.send_text.config(state=tk.NORMAL)  # 启用文本输入框
+            self.send_button.config(text="发送 (Ctrl+Enter)")
+    
+    def browse_file(self):
+        """浏览选择文件"""
+        file_path = filedialog.askopenfilename(
+            title="选择要发送的文件",
+            filetypes=[
+                ("所有文件", "*.*"),
+                ("文本文件", "*.txt"),
+                ("图片文件", "*.jpg;*.png;*.gif;*.bmp"),
+                ("文档文件", "*.doc;*.docx;*.pdf")
+            ]
+        )
+        if file_path:
+            self.file_path_var.set(file_path)
+
+    def send_file(self, file_path):
+        """发送文件到服务器"""
+        if not os.path.exists(file_path):
+            self.update_status("文件不存在！")
+            messagebox.showerror("错误", "选择的文件不存在！")
+            return False
+            
+        file_size = os.path.getsize(file_path)
+        filename = os.path.basename(file_path)
+        
+        # 检查文件大小（限制为10MB）
+        if file_size > 10 * 1024 * 1024:
+            if not messagebox.askyesno("警告", f"文件大小为 {file_size/1024/1024:.2f}MB，可能发送失败。是否继续？"):
+                return False
+        
+        try:
+            encoding = self.encoding_var.get()
+            
+            # 发送文件头信息：标识符 + 文件名长度 + 文件名 + 文件大小
+            header = "FILE_TRANSFER:"
+            filename_encoded = filename.encode(encoding)
+            header_data = header.encode('ascii') + struct.pack('I', len(filename_encoded)) + filename_encoded + struct.pack('Q', file_size)
+            self.client_socket.sendall(header_data)
+            
+            # 发送文件内容
+            sent_bytes = 0
+            with open(file_path, 'rb') as f:
+                while sent_bytes < file_size:
+                    chunk = f.read(4096)  # 每次读取4KB
+                    if not chunk:
+                        break
+                    self.client_socket.sendall(chunk)
+                    sent_bytes += len(chunk)
+                    
+                    # 更新进度
+                    progress = (sent_bytes / file_size) * 100
+                    self.update_status(f"发送进度: {progress:.1f}% ({sent_bytes}/{file_size} 字节)")
+            
+            timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+            self.update_status(f"文件发送完成: {filename} ({file_size} 字节)")
+            
+            # 在接收区域显示发送的文件信息
+            self.receive_text.config(state=tk.NORMAL)
+            self.receive_text.insert(tk.END, f"[{timestamp}] 我: [文件] {filename} ({file_size} 字节)\n")
+            self.receive_text.see(tk.END)
+            self.receive_text.config(state=tk.DISABLED)
+            
+            return True
+            
+        except Exception as e:
+            self.update_status(f"文件发送失败: {e}")
+            messagebox.showerror("发送失败", f"文件发送失败：{e}")
+            return False
 
     def disconnect_from_server(self):
         """断开与服务器的连接"""
