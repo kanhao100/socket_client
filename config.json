@@ -1,0 +1,6 @@
+{
+    "host": "127.0.0.1",
+    "port": "8888",
+    "encoding": "utf-8",
+    "clipboard_monitor": true
+}
