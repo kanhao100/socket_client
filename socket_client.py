@@ -6,6 +6,7 @@ import datetime
 import os
 import struct
 import json
+import sys
 
 class SocketClientGUI:
     def __init__(self, master):
@@ -23,8 +24,14 @@ class SocketClientGUI:
         self.last_clipboard_content = ""
         self.clipboard_check_id = None
 
-        # 配置文件路径
-        self.config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+        # 配置文件路径（兼容打包后的情况）
+        if getattr(sys, 'frozen', False) or hasattr(sys, '_MEIPASS'):
+            # 打包后的情况：使用可执行文件所在目录
+            application_path = os.path.dirname(sys.executable)
+        else:
+            # 开发环境：使用脚本所在目录
+            application_path = os.path.dirname(os.path.abspath(__file__))
+        self.config_file = os.path.join(application_path, "config.json")
         
         # 加载配置
         config = self.load_config()

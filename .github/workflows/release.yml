@@ -22,12 +22,19 @@ jobs:
         python -m pip install --upgrade pip
         pip install pyinstaller
 
-    - name: Build executable
-      run: pyinstaller --onefile --windowed --name socket_client socket_client.py
+    - name: Extract version and build executable
+      shell: pwsh
+      run: |
+        $version = "${{ github.ref_name }}" -replace '^v', ''
+        $arch = "${{ runner.arch }}".ToLower()
+        $exeName = "socket_client-v$version-$arch"
+        Write-Host "Building: $exeName.exe (Architecture: $arch)"
+        echo "EXE_NAME=$exeName" >> $env:GITHUB_ENV
+        pyinstaller --onefile --windowed --name $exeName socket_client.py
 
     - name: Upload to Release
       uses: softprops/action-gh-release@v1
       with:
-        files: dist/socket_client.exe
+        files: dist/${{ env.EXE_NAME }}.exe
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
