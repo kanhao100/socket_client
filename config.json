@@ -7,6 +7,19 @@
     "stt_language": "en-US",
     "stt_region": "southeastasia",
     "stt_endpoint": "",
+    "stt_endpoint_id": "",
     "stt_key": "",
-    "stt_send_final_to_socket": false
+    "stt_auto_detect_languages": "",
+    "stt_language_id_mode": "Continuous",
+    "stt_profanity": "Raw",
+    "stt_output_format": "Simple",
+    "stt_word_level_timestamps": false,
+    "stt_dictation_enabled": false,
+    "stt_audio_logging_enabled": false,
+    "stt_stable_partial_result_threshold": "0",
+    "stt_segmentation_silence_timeout_ms": "0",
+    "stt_initial_silence_timeout_ms": "0",
+    "stt_segmentation_strategy": "Semantic",
+    "stt_phrase_list": "",
+    "stt_send_final_to_socket": true
 }

@@ -9,10 +9,11 @@ import json
 import sys
 import queue
 
-try:
-    import azure.cognitiveservices.speech as speechsdk
-except Exception:
-    speechsdk = None
+from azure_realtime_stt import (
+    AzureRealtimeSttConfig,
+    create_realtime_stt_worker,
+    is_azure_speech_sdk_available,
+)
 
 
 class SocketClientGUI:
@@ -35,6 +36,9 @@ class SocketClientGUI:
         self.stt_queue = queue.Queue()
         self.stt_thread = None
         self.stt_stop_event = threading.Event()
+        self._subtitle_history = []
+        self._subtitle_live_line = ""
+        self._subtitle_max_lines = 200
 
         if getattr(sys, 'frozen', False) or hasattr(sys, '_MEIPASS'):
             application_path = os.path.dirname(sys.executable)
@@ -317,31 +321,52 @@ class SocketClientGUI:
                               padding=10)
         stt.grid(row=r, column=0, sticky="ew", pady=(0, 10))
         stt.columnconfigure(1, weight=1)
+        stt.columnconfigure(3, weight=1)
         r += 1
 
         chk_row = ttk.Frame(stt)
-        chk_row.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        chk_row.grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
         self.stt_enabled_var = tk.BooleanVar(value=config.get("stt_enabled", False))
-        ttk.Checkbutton(chk_row, text="启用实时字幕",
-                        variable=self.stt_enabled_var,
-                        command=self.on_stt_config_change).pack(
-            side=tk.LEFT, padx=(0, 20))
+        ttk.Checkbutton(
+            chk_row,
+            text="启用实时字幕",
+            variable=self.stt_enabled_var,
+            command=self.on_stt_config_change,
+        ).pack(side=tk.LEFT, padx=(0, 20))
         self.stt_send_final_var = tk.BooleanVar(
-            value=config.get("stt_send_final_to_socket", False))
-        ttk.Checkbutton(chk_row, text="最终识别结果自动发送到 Socket",
-                        variable=self.stt_send_final_var,
-                        command=self.on_stt_config_change).pack(side=tk.LEFT)
+            value=config.get("stt_send_final_to_socket", False)
+        )
+        ttk.Checkbutton(
+            chk_row,
+            text="最终识别结果自动发送到 Socket",
+            variable=self.stt_send_final_var,
+            command=self.on_stt_config_change,
+        ).pack(side=tk.LEFT)
+
+        supported_langs = ["zh-CN", "en-US", "ja-JP", "ko-KR", "fr-FR",
+                           "de-DE", "es-ES", "ru-RU", "it-IT", "pt-BR"]
 
         ttk.Label(stt, text="识别语言:").grid(
             row=1, column=0, sticky="w", pady=3, padx=(0, 8))
-        supported_langs = ["zh-CN", "en-US", "ja-JP", "ko-KR", "fr-FR",
-                           "de-DE", "es-ES", "ru-RU", "it-IT", "pt-BR"]
         self.stt_language_var = tk.StringVar(
             value=config.get("stt_language", "zh-CN"))
-        lang_cb = ttk.Combobox(stt, textvariable=self.stt_language_var,
-                               values=supported_langs, state="readonly", width=18)
+        lang_cb = ttk.Combobox(
+            stt,
+            textvariable=self.stt_language_var,
+            values=supported_langs,
+            state="readonly",
+            width=18,
+        )
         lang_cb.grid(row=1, column=1, sticky="w", pady=3)
         lang_cb.bind("<<ComboboxSelected>>", lambda _: self.on_stt_config_change())
+
+        ttk.Label(stt, text="自动识别语言:").grid(
+            row=1, column=2, sticky="w", pady=3, padx=(12, 8))
+        self.stt_auto_detect_languages_entry = ttk.Entry(stt, width=36)
+        self.stt_auto_detect_languages_entry.grid(
+            row=1, column=3, sticky="ew", pady=3)
+        self.stt_auto_detect_languages_entry.insert(
+            0, config.get("stt_auto_detect_languages", ""))
 
         ttk.Label(stt, text="区域 (Region):").grid(
             row=2, column=0, sticky="w", pady=3, padx=(0, 8))
@@ -350,22 +375,147 @@ class SocketClientGUI:
         self.stt_region_entry.insert(0, config.get("stt_region", "southeastasia"))
 
         ttk.Label(stt, text="终结点 (可选):").grid(
-            row=3, column=0, sticky="w", pady=3, padx=(0, 8))
-        self.stt_endpoint_entry = ttk.Entry(stt, width=44)
-        self.stt_endpoint_entry.grid(row=3, column=1, sticky="ew", pady=3)
+            row=2, column=2, sticky="w", pady=3, padx=(12, 8))
+        self.stt_endpoint_entry = ttk.Entry(stt, width=36)
+        self.stt_endpoint_entry.grid(row=2, column=3, sticky="ew", pady=3)
         self.stt_endpoint_entry.insert(0, config.get("stt_endpoint", ""))
 
+        ttk.Label(stt, text="Endpoint ID (可选):").grid(
+            row=3, column=0, sticky="w", pady=3, padx=(0, 8))
+        self.stt_endpoint_id_entry = ttk.Entry(stt, width=28)
+        self.stt_endpoint_id_entry.grid(row=3, column=1, sticky="ew", pady=3)
+        self.stt_endpoint_id_entry.insert(0, config.get("stt_endpoint_id", ""))
+
         ttk.Label(stt, text="订阅 Key (可选):").grid(
-            row=4, column=0, sticky="w", pady=(3, 8), padx=(0, 8))
-        self.stt_key_entry = ttk.Entry(stt, width=44, show="*")
-        self.stt_key_entry.grid(row=4, column=1, sticky="ew", pady=(3, 8))
+            row=3, column=2, sticky="w", pady=3, padx=(12, 8))
+        self.stt_key_entry = ttk.Entry(stt, width=36, show="*")
+        self.stt_key_entry.grid(row=3, column=3, sticky="ew", pady=3)
         self.stt_key_entry.insert(0, config.get("stt_key", ""))
+
+        flag_row = ttk.Frame(stt)
+        flag_row.grid(row=4, column=0, columnspan=4, sticky="w", pady=(4, 6))
+        self.stt_word_level_var = tk.BooleanVar(
+            value=config.get("stt_word_level_timestamps", False)
+        )
+        ttk.Checkbutton(
+            flag_row,
+            text="词级时间戳",
+            variable=self.stt_word_level_var,
+            command=self.on_stt_config_change,
+        ).pack(side=tk.LEFT, padx=(0, 16))
+        self.stt_dictation_var = tk.BooleanVar(
+            value=config.get("stt_dictation_enabled", False)
+        )
+        ttk.Checkbutton(
+            flag_row,
+            text="听写模式",
+            variable=self.stt_dictation_var,
+            command=self.on_stt_config_change,
+        ).pack(side=tk.LEFT, padx=(0, 16))
+        self.stt_audio_logging_var = tk.BooleanVar(
+            value=config.get("stt_audio_logging_enabled", False)
+        )
+        ttk.Checkbutton(
+            flag_row,
+            text="启用音频日志",
+            variable=self.stt_audio_logging_var,
+            command=self.on_stt_config_change,
+        ).pack(side=tk.LEFT)
+
+        ttk.Label(stt, text="脏词处理:").grid(
+            row=5, column=0, sticky="w", pady=3, padx=(0, 8))
+        self.stt_profanity_var = tk.StringVar(
+            value=config.get("stt_profanity", "Masked"))
+        profanity_cb = ttk.Combobox(
+            stt,
+            textvariable=self.stt_profanity_var,
+            values=["Masked", "Raw", "Removed"],
+            state="readonly",
+            width=18,
+        )
+        profanity_cb.grid(row=5, column=1, sticky="w", pady=3)
+        profanity_cb.bind("<<ComboboxSelected>>",
+                          lambda _: self.on_stt_config_change())
+
+        ttk.Label(stt, text="输出格式:").grid(
+            row=5, column=2, sticky="w", pady=3, padx=(12, 8))
+        self.stt_output_format_var = tk.StringVar(
+            value=config.get("stt_output_format", "Simple"))
+        output_cb = ttk.Combobox(
+            stt,
+            textvariable=self.stt_output_format_var,
+            values=["Simple", "Detailed"],
+            state="readonly",
+            width=18,
+        )
+        output_cb.grid(row=5, column=3, sticky="w", pady=3)
+        output_cb.bind("<<ComboboxSelected>>",
+                       lambda _: self.on_stt_config_change())
+
+        ttk.Label(stt, text="语言识别模式:").grid(
+            row=6, column=0, sticky="w", pady=3, padx=(0, 8))
+        self.stt_language_id_mode_var = tk.StringVar(
+            value=config.get("stt_language_id_mode", "AtStart"))
+        lid_mode_cb = ttk.Combobox(
+            stt,
+            textvariable=self.stt_language_id_mode_var,
+            values=["AtStart", "Continuous"],
+            state="readonly",
+            width=18,
+        )
+        lid_mode_cb.grid(row=6, column=1, sticky="w", pady=3)
+        lid_mode_cb.bind("<<ComboboxSelected>>",
+                         lambda _: self.on_stt_config_change())
+
+        ttk.Label(stt, text="分段策略:").grid(
+            row=6, column=2, sticky="w", pady=3, padx=(12, 8))
+        self.stt_segmentation_strategy_var = tk.StringVar(
+            value=config.get("stt_segmentation_strategy", "Default"))
+        segmentation_cb = ttk.Combobox(
+            stt,
+            textvariable=self.stt_segmentation_strategy_var,
+            values=["Default", "Semantic"],
+            state="readonly",
+            width=18,
+        )
+        segmentation_cb.grid(row=6, column=3, sticky="w", pady=3)
+        segmentation_cb.bind("<<ComboboxSelected>>",
+                             lambda _: self.on_stt_config_change())
+
+        ttk.Label(stt, text="增量稳定阈值:").grid(
+            row=7, column=0, sticky="w", pady=3, padx=(0, 8))
+        self.stt_stable_partial_entry = ttk.Entry(stt, width=18)
+        self.stt_stable_partial_entry.grid(row=7, column=1, sticky="w", pady=3)
+        self.stt_stable_partial_entry.insert(
+            0, config.get("stt_stable_partial_result_threshold", "0"))
+
+        ttk.Label(stt, text="分段静音超时(ms):").grid(
+            row=7, column=2, sticky="w", pady=3, padx=(12, 8))
+        self.stt_segmentation_silence_entry = ttk.Entry(stt, width=18)
+        self.stt_segmentation_silence_entry.grid(
+            row=7, column=3, sticky="w", pady=3)
+        self.stt_segmentation_silence_entry.insert(
+            0, config.get("stt_segmentation_silence_timeout_ms", "0"))
+
+        ttk.Label(stt, text="起始静音超时(ms):").grid(
+            row=8, column=0, sticky="w", pady=3, padx=(0, 8))
+        self.stt_initial_silence_entry = ttk.Entry(stt, width=18)
+        self.stt_initial_silence_entry.grid(row=8, column=1, sticky="w", pady=3)
+        self.stt_initial_silence_entry.insert(
+            0, config.get("stt_initial_silence_timeout_ms", "0"))
+
+        ttk.Label(stt, text="短语提示:").grid(
+            row=8, column=2, sticky="w", pady=3, padx=(12, 8))
+        self.stt_phrase_list_entry = ttk.Entry(stt, width=36)
+        self.stt_phrase_list_entry.grid(row=8, column=3, sticky="ew", pady=3)
+        self.stt_phrase_list_entry.insert(0, config.get("stt_phrase_list", ""))
 
         # Hint
         ttk.Label(
             inner,
             text="提示：Key/Region/Endpoint 也可通过环境变量设置："
-                 " AZURE_SPEECH_KEY / AZURE_SPEECH_REGION / AZURE_SPEECH_ENDPOINT",
+                 " AZURE_SPEECH_KEY / AZURE_SPEECH_REGION / AZURE_SPEECH_ENDPOINT\n"
+                 "自动识别语言与短语提示支持逗号分隔；未填 Endpoint 且启用 Continuous 语言识别时，会自动切到 Speech v2 endpoint。",
             foreground="#888888",
             font=("Segoe UI", 8)).grid(
             row=r, column=0, sticky="w", pady=(0, 12))
@@ -398,7 +548,20 @@ class SocketClientGUI:
             "stt_language": "zh-CN",
             "stt_region": "southeastasia",
             "stt_endpoint": "",
+            "stt_endpoint_id": "",
             "stt_key": "",
+            "stt_auto_detect_languages": "",
+            "stt_language_id_mode": "AtStart",
+            "stt_profanity": "Masked",
+            "stt_output_format": "Simple",
+            "stt_word_level_timestamps": False,
+            "stt_dictation_enabled": False,
+            "stt_audio_logging_enabled": False,
+            "stt_stable_partial_result_threshold": "0",
+            "stt_segmentation_silence_timeout_ms": "0",
+            "stt_initial_silence_timeout_ms": "0",
+            "stt_segmentation_strategy": "Default",
+            "stt_phrase_list": "",
             "stt_send_final_to_socket": False,
         }
         if os.path.exists(self.config_file):
@@ -415,6 +578,36 @@ class SocketClientGUI:
             self.save_config(default)
             return default
 
+    def get_stt_settings(self):
+        return {
+            "stt_enabled": self.stt_enabled_var.get(),
+            "stt_language": self.stt_language_var.get().strip() or "zh-CN",
+            "stt_region": self.stt_region_entry.get().strip(),
+            "stt_endpoint": self.stt_endpoint_entry.get().strip(),
+            "stt_endpoint_id": self.stt_endpoint_id_entry.get().strip(),
+            "stt_key": self.stt_key_entry.get().strip(),
+            "stt_auto_detect_languages":
+                self.stt_auto_detect_languages_entry.get().strip(),
+            "stt_language_id_mode":
+                self.stt_language_id_mode_var.get().strip() or "AtStart",
+            "stt_profanity": self.stt_profanity_var.get().strip() or "Masked",
+            "stt_output_format":
+                self.stt_output_format_var.get().strip() or "Simple",
+            "stt_word_level_timestamps": self.stt_word_level_var.get(),
+            "stt_dictation_enabled": self.stt_dictation_var.get(),
+            "stt_audio_logging_enabled": self.stt_audio_logging_var.get(),
+            "stt_stable_partial_result_threshold":
+                self.stt_stable_partial_entry.get().strip(),
+            "stt_segmentation_silence_timeout_ms":
+                self.stt_segmentation_silence_entry.get().strip(),
+            "stt_initial_silence_timeout_ms":
+                self.stt_initial_silence_entry.get().strip(),
+            "stt_segmentation_strategy":
+                self.stt_segmentation_strategy_var.get().strip() or "Default",
+            "stt_phrase_list": self.stt_phrase_list_entry.get().strip(),
+            "stt_send_final_to_socket": self.stt_send_final_var.get(),
+        }
+
     def save_config(self, config=None):
         if config is None:
             config = {
@@ -422,12 +615,7 @@ class SocketClientGUI:
                 "port": self.port_entry.get().strip(),
                 "encoding": self.encoding_var.get(),
                 "clipboard_monitor": self.clipboard_monitor_var.get(),
-                "stt_enabled": self.stt_enabled_var.get(),
-                "stt_language": self.stt_language_var.get().strip() or "zh-CN",
-                "stt_region": self.stt_region_entry.get().strip(),
-                "stt_endpoint": self.stt_endpoint_entry.get().strip(),
-                "stt_key": self.stt_key_entry.get().strip(),
-                "stt_send_final_to_socket": self.stt_send_final_var.get(),
+                **self.get_stt_settings(),
             }
         try:
             with open(self.config_file, 'w', encoding='utf-8') as f:
@@ -467,19 +655,63 @@ class SocketClientGUI:
         self.status_text.config(state=tk.DISABLED)
 
     def clear_subtitle_area(self):
+        self._subtitle_history = []
+        self._subtitle_live_line = ""
+        self._render_subtitle_area()
+
+    def _render_subtitle_area(self):
+        lines = list(self._subtitle_history)
+        if self._subtitle_live_line:
+            lines.append(self._subtitle_live_line)
+
+        if len(lines) > self._subtitle_max_lines:
+            lines = lines[-self._subtitle_max_lines:]
+            self._subtitle_history = lines[:-1] if self._subtitle_live_line else lines
+
+        content = ""
+        if lines:
+            content = "\n".join(lines) + "\n"
+
         self.subtitle_text.config(state=tk.NORMAL)
         self.subtitle_text.delete(1.0, tk.END)
+        if content:
+            self.subtitle_text.insert(tk.END, content)
+            self.subtitle_text.see(tk.END)
         self.subtitle_text.config(state=tk.DISABLED)
 
-    def update_subtitle_area(self, text, final=False):
+    def _extract_stt_text(self, payload):
+        if isinstance(payload, dict):
+            return (payload.get("text") or "").strip()
+        return str(payload or "").strip()
+
+    def _format_subtitle_line(self, payload, final=False):
+        text = self._extract_stt_text(payload)
         if not text:
-            return
+            return ""
+
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         prefix = "[最终]" if final else "[识别中]"
-        self.subtitle_text.config(state=tk.NORMAL)
-        self.subtitle_text.insert(tk.END, f"[{timestamp}] {prefix} {text}\n")
-        self.subtitle_text.see(tk.END)
-        self.subtitle_text.config(state=tk.DISABLED)
+        language_tag = ""
+        if isinstance(payload, dict):
+            detected_language = (payload.get("detected_language") or "").strip()
+            if detected_language:
+                language_tag = f"[{detected_language}]"
+        return f"[{timestamp}] {prefix}{language_tag} {text}"
+
+    def update_subtitle_area(self, payload, final=False):
+        line = self._format_subtitle_line(payload, final=final)
+        if not line:
+            return
+
+        if final:
+            self._subtitle_live_line = ""
+            self._subtitle_history.append(line)
+            if len(self._subtitle_history) > self._subtitle_max_lines:
+                self._subtitle_history = self._subtitle_history[-self._subtitle_max_lines:]
+        else:
+            self._subtitle_live_line = line
+
+        self._render_subtitle_area()
 
     # ──────────────────────────── Connection ────────────────────────────
 
@@ -600,6 +832,48 @@ class SocketClientGUI:
 
     # ──────────────────────────── Send ────────────────────────────
 
+    def _send_text_payload(self, message, source_label="我",
+                           clear_input=False, show_dialog=True):
+        try:
+            encoding = self.encoding_var.get()
+            try:
+                encoded = message.encode(encoding)
+            except UnicodeEncodeError as e:
+                self.update_status(f"编码失败：{encoding}")
+                if show_dialog:
+                    messagebox.showerror(
+                        "编码错误",
+                        f"无法用 {encoding} 编码。\n{e}",
+                    )
+                return False
+
+            self.client_socket.sendall(encoded)
+            timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+            self.update_status(f"{source_label}消息已发送（编码: {encoding}）")
+            self.receive_text.config(state=tk.NORMAL)
+            self.receive_text.insert(
+                tk.END, f"[{timestamp}] {source_label}: {message}\n")
+            self.receive_text.see(tk.END)
+            self.receive_text.config(state=tk.DISABLED)
+
+            if clear_input:
+                self.send_text.delete(1.0, tk.END)
+            return True
+
+        except (BrokenPipeError, ConnectionResetError):
+            self.update_status("发送失败：连接已断开。")
+            if show_dialog:
+                messagebox.showerror("错误", "连接已断开，请重新连接。")
+            self.disconnect_from_server()
+            return False
+        except OSError as e:
+            self.update_status(f"发送失败：{e}")
+            self.disconnect_from_server()
+            return False
+        except Exception as e:
+            self.update_status(f"发送异常：{e}")
+            return False
+
     def send_message(self):
         if not self.is_connected or not self.client_socket:
             self.update_status("尚未连接到服务器。")
@@ -620,33 +894,12 @@ class SocketClientGUI:
             self.update_status("发送内容不能为空。")
             return
 
-        try:
-            encoding = self.encoding_var.get()
-            try:
-                encoded = message.encode(encoding)
-            except UnicodeEncodeError as e:
-                self.update_status(f"编码失败：{encoding}")
-                messagebox.showerror("编码错误", f"无法用 {encoding} 编码。\n{e}")
-                return
-
-            self.client_socket.sendall(encoded)
-            timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-            self.update_status(f"消息已发送（编码: {encoding}）")
-            self.receive_text.config(state=tk.NORMAL)
-            self.receive_text.insert(tk.END, f"[{timestamp}] 我: {message}\n")
-            self.receive_text.see(tk.END)
-            self.receive_text.config(state=tk.DISABLED)
-            self.send_text.delete(1.0, tk.END)
-
-        except (BrokenPipeError, ConnectionResetError):
-            self.update_status("发送失败：连接已断开。")
-            messagebox.showerror("错误", "连接已断开，请重新连接。")
-            self.disconnect_from_server()
-        except OSError as e:
-            self.update_status(f"发送失败：{e}")
-            self.disconnect_from_server()
-        except Exception as e:
-            self.update_status(f"发送异常：{e}")
+        self._send_text_payload(
+            message,
+            source_label="我",
+            clear_input=True,
+            show_dialog=True,
+        )
 
     def on_send_mode_change(self):
         if self.send_mode_var.get() == "file":
@@ -763,84 +1016,18 @@ class SocketClientGUI:
     def on_stt_config_change(self):
         self.save_config()
 
-    def build_speech_config(self):
-        """构建 Azure Speech 配置（预留接口，可替换为其他识别后端）"""
-        key = (self.stt_key_entry.get().strip()
-               or os.getenv("AZURE_SPEECH_KEY", "").strip())
-        region = (self.stt_region_entry.get().strip()
-                  or os.getenv("AZURE_SPEECH_REGION", "southeastasia").strip())
-        endpoint = (self.stt_endpoint_entry.get().strip()
-                    or os.getenv("AZURE_SPEECH_ENDPOINT", "").strip())
+    def build_stt_options(self):
+        return AzureRealtimeSttConfig.from_mapping(self.get_stt_settings())
 
-        if not key:
-            raise ValueError(
-                "缺少订阅 Key，请在设置页面填写或设置环境变量 AZURE_SPEECH_KEY。")
+    def _emit_stt_event(self, event_type, payload):
+        self.stt_queue.put((event_type, payload))
 
-        if endpoint:
-            cfg = speechsdk.SpeechConfig(subscription=key, endpoint=endpoint)
-        else:
-            cfg = speechsdk.SpeechConfig(subscription=key, region=region)
-
-        cfg.speech_recognition_language = (
-            self.stt_language_var.get().strip() or "zh-CN")
-        return cfg
-
-    def create_realtime_subtitle_worker(self):
-        """预留接口：返回工作函数，后续可替换为自己的 API 实现"""
-        def worker():
-            try:
-                if speechsdk is None:
-                    self.stt_queue.put(("status",
-                                        "未安装 azure-cognitiveservices-speech，"
-                                        "无法启动实时字幕。"))
-                    self.stt_queue.put(("stopped", ""))
-                    return
-
-                speech_config = self.build_speech_config()
-                audio_config = speechsdk.audio.AudioConfig(
-                    use_default_microphone=True)
-                recognizer = speechsdk.SpeechRecognizer(
-                    speech_config=speech_config,
-                    audio_config=audio_config)
-
-                def on_recognizing(evt):
-                    text = (evt.result.text or "").strip()
-                    if text:
-                        self.stt_queue.put(("partial", text))
-
-                def on_recognized(evt):
-                    result = evt.result
-                    if result.reason == speechsdk.ResultReason.RecognizedSpeech:
-                        text = (result.text or "").strip()
-                        if text:
-                            self.stt_queue.put(("final", text))
-                    elif result.reason == speechsdk.ResultReason.NoMatch:
-                        self.stt_queue.put(("status", "未匹配到语音"))
-
-                def on_canceled(evt):
-                    if evt.reason == speechsdk.CancellationReason.Error:
-                        self.stt_queue.put(
-                            ("status", f"字幕取消（错误）：{evt.error_details}"))
-                    else:
-                        self.stt_queue.put(
-                            ("status", f"字幕会话取消：{evt.reason}"))
-
-                recognizer.recognizing.connect(on_recognizing)
-                recognizer.recognized.connect(on_recognized)
-                recognizer.canceled.connect(on_canceled)
-
-                self.stt_queue.put(("status", "实时字幕线程已启动"))
-                recognizer.start_continuous_recognition()
-                while not self.stt_stop_event.is_set():
-                    self.stt_stop_event.wait(0.2)
-                recognizer.stop_continuous_recognition()
-
-            except Exception as e:
-                self.stt_queue.put(("status", f"实时字幕线程异常：{e}"))
-            finally:
-                self.stt_queue.put(("stopped", ""))
-
-        return worker
+    def create_realtime_subtitle_worker(self, stt_options):
+        return create_realtime_stt_worker(
+            stt_options,
+            self.stt_stop_event,
+            self._emit_stt_event,
+        )
 
     def start_stt_thread(self):
         self.on_stt_config_change()
@@ -850,8 +1037,19 @@ class SocketClientGUI:
         if not self.stt_enabled_var.get():
             self.update_status('请先在「设置」中勾选"启用实时字幕"。')
             return
+        if not is_azure_speech_sdk_available():
+            self.update_status(
+                "未安装 azure-cognitiveservices-speech，无法启动实时字幕。")
+            return
+
+        try:
+            stt_options = self.build_stt_options()
+        except ValueError as e:
+            self.update_status(f"实时字幕配置错误：{e}")
+            return
+
         self.stt_stop_event.clear()
-        worker = self.create_realtime_subtitle_worker()
+        worker = self.create_realtime_subtitle_worker(stt_options)
         self.stt_thread = threading.Thread(target=worker, daemon=True)
         self.stt_thread.start()
         self.stt_start_button.config(state=tk.DISABLED)
@@ -876,12 +1074,17 @@ class SocketClientGUI:
                     self.update_subtitle_area(payload, final=False)
                 elif event_type == "final":
                     self.update_subtitle_area(payload, final=True)
+                    final_text = self._extract_stt_text(payload)
                     if (self.stt_send_final_var.get()
                             and self.is_connected
-                            and self.client_socket):
-                        self.send_text.delete(1.0, tk.END)
-                        self.send_text.insert(1.0, payload)
-                        self.send_message()
+                            and self.client_socket
+                            and final_text):
+                        self._send_text_payload(
+                            final_text,
+                            source_label="字幕",
+                            clear_input=False,
+                            show_dialog=False,
+                        )
                 elif event_type == "status":
                     self.update_status(payload)
                 elif event_type == "stopped":
