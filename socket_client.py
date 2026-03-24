@@ -9,6 +9,17 @@ import json
 import sys
 import queue
 import uuid
+import io
+import base64
+import urllib.request
+import urllib.error
+
+try:
+    from PIL import Image, ImageGrab, ImageTk
+except ImportError:
+    Image = None
+    ImageGrab = None
+    ImageTk = None
 
 from azure_realtime_stt import (
     AzureRealtimeSttConfig,
@@ -49,6 +60,21 @@ class SocketClientGUI:
         self._caption_segment_seq = 0
         self._caption_last_partial_text = ""
         self._caption_last_partial_lang = ""
+        self._subtitle_final_events = []
+        self._manual_segment_active = False
+        self._manual_segment_start_index = 0
+        self._manual_segment_start_time = None
+
+        self._ai_clipboard_image_bytes = None
+        self._ai_clipboard_image_mime = ""
+        self._ai_preview_photo = None
+        self._ai_request_thread = None
+        self._manual_segment_pending_send = False
+        self._last_manual_segment_meta = None
+        self._quick_panel = None
+        self._quick_toggle_stt_button = None
+        self._quick_segment_button = None
+        self._stt_stopping_requested = False
 
         if getattr(sys, 'frozen', False) or hasattr(sys, '_MEIPASS'):
             application_path = os.path.dirname(sys.executable)
@@ -63,12 +89,16 @@ class SocketClientGUI:
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
         self._main_frame = ttk.Frame(self.notebook)
+        self._ai_frame = ttk.Frame(self.notebook)
         self._settings_frame = ttk.Frame(self.notebook)
         self.notebook.add(self._main_frame, text="   主界面   ")
+        self.notebook.add(self._ai_frame, text="   AI   ")
         self.notebook.add(self._settings_frame, text="   ⚙ 设置   ")
 
         self._build_main_tab(config)
+        self._build_ai_tab(config)
         self._build_settings_tab(config)
+        self._build_quick_control_panel()
 
         master.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.master.after(100, self.process_stt_events)
@@ -129,7 +159,17 @@ class SocketClientGUI:
         self.disconnect_button.pack(side=tk.LEFT, padx=2)
 
         ttk.Button(conn, text="⚙ 设置",
-                   command=lambda: self.notebook.select(1)).pack(side=tk.RIGHT)
+                   command=lambda: self.notebook.select(2)).pack(side=tk.RIGHT)
+        self.quick_panel_toggle_button = tk.Button(
+            conn,
+            text="快捷窗",
+            relief=tk.SOLID,
+            bd=1,
+            padx=8,
+            pady=2,
+            command=self.toggle_quick_panel,
+        )
+        self.quick_panel_toggle_button.pack(side=tk.RIGHT, padx=(0, 6))
 
         # ── Row 1: 垂直 PanedWindow（上：发送+字幕 / 下：接收）──
         v_paned = tk.PanedWindow(f, orient=tk.VERTICAL,
@@ -204,6 +244,17 @@ class SocketClientGUI:
                                           command=self.stop_stt_thread,
                                           state=tk.DISABLED)
         self.stt_stop_button.pack(side=tk.LEFT)
+        self.manual_segment_button = ttk.Button(
+            stt_ctrl,
+            text="片段开始",
+            command=self.toggle_manual_segment,
+        )
+        self.manual_segment_button.pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(
+            stt_ctrl,
+            text="粘贴图片",
+            command=self.paste_ai_image,
+        ).pack(side=tk.LEFT, padx=(8, 0))
         self._stt_dot = ttk.Label(stt_ctrl, text="●", foreground="#CCCCCC",
                                   font=("Segoe UI", 12))
         self._stt_dot.pack(side=tk.LEFT, padx=(6, 0))
@@ -216,6 +267,9 @@ class SocketClientGUI:
         ttk.Button(sub_lf, text="清空字幕",
                    command=self.clear_subtitle_area).grid(
             row=2, column=0, sticky="e", pady=(3, 0))
+
+        # 默认右侧更宽（字幕区）
+        f.after(120, lambda: self._set_main_paned_ratio(h_paned, left_ratio=0.42))
 
         # ── 下半：接收区 ──
         recv_lf = ttk.LabelFrame(v_paned, text="接收消息", padding=4)
@@ -247,6 +301,239 @@ class SocketClientGUI:
         ttk.Button(status_lf, text="清空",
                    command=self.clear_status_area).grid(
             row=1, column=0, sticky="e", pady=(2, 0))
+
+    def _set_main_paned_ratio(self, paned, left_ratio=0.42):
+        try:
+            paned.update_idletasks()
+            width = paned.winfo_width()
+            if width <= 40:
+                return
+            sash_x = max(160, int(width * left_ratio))
+            paned.sash_place(0, sash_x, 1)
+        except Exception:
+            pass
+
+    def _build_quick_control_panel(self):
+        panel = tk.Toplevel(self.master)
+        panel.geometry("300x78+40+40")
+        panel.resizable(False, False)
+        panel.attributes("-topmost", True)
+        panel.overrideredirect(True)
+        panel.protocol("WM_DELETE_WINDOW", panel.withdraw)
+        self._quick_panel = panel
+
+        wrap = ttk.Frame(panel, padding=(4, 4, 4, 4))
+        wrap.pack(fill=tk.BOTH, expand=True)
+        self._quick_wrap = wrap
+
+        row1 = ttk.Frame(wrap)
+        row1.pack(fill=tk.X, pady=(0, 3))
+        row2 = ttk.Frame(wrap)
+        row2.pack(fill=tk.X)
+
+        self._quick_stt_dot = tk.Label(
+            row1, text="●", fg="#CCCCCC", bg=panel.cget("bg"), font=("Segoe UI", 10)
+        )
+        self._quick_stt_dot.pack(side=tk.LEFT, padx=(2, 4))
+
+        self._quick_toggle_stt_button = ttk.Button(
+            row1,
+            text="启动",
+            width=6,
+            command=self._toggle_stt_from_quick_panel,
+        )
+        self._quick_toggle_stt_button.pack(side=tk.LEFT, padx=(0, 4))
+
+        self._quick_segment_button = ttk.Button(
+            row1,
+            text="片段开始",
+            width=8,
+            command=self.toggle_manual_segment,
+        )
+        self._quick_segment_button.pack(side=tk.LEFT, padx=(0, 4))
+
+        ttk.Button(
+            row1,
+            text="粘贴图片",
+            width=8,
+            command=self.paste_ai_image,
+        ).pack(side=tk.LEFT)
+
+        self._quick_scene_buttons_frame = ttk.Frame(row2)
+        self._quick_scene_buttons_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._quick_scene_buttons = {}
+        self._render_quick_scene_buttons()
+
+        self._quick_drag_x = 0
+        self._quick_drag_y = 0
+        for widget in (panel, wrap, row1, row2, self._quick_stt_dot):
+            widget.bind("<ButtonPress-1>", self._on_quick_drag_start)
+            widget.bind("<B1-Motion>", self._on_quick_drag_move)
+
+        self._sync_quick_panel_buttons()
+        self._sync_quick_panel_toggle_button()
+
+    def _on_quick_drag_start(self, event):
+        self._quick_drag_x = event.x_root
+        self._quick_drag_y = event.y_root
+
+    def _on_quick_drag_move(self, event):
+        if not self._quick_panel:
+            return
+        dx = event.x_root - self._quick_drag_x
+        dy = event.y_root - self._quick_drag_y
+        x = self._quick_panel.winfo_x() + dx
+        y = self._quick_panel.winfo_y() + dy
+        self._quick_panel.geometry(f"+{x}+{y}")
+        self._quick_drag_x = event.x_root
+        self._quick_drag_y = event.y_root
+
+    def _render_quick_scene_buttons(self):
+        if not hasattr(self, "_quick_scene_buttons_frame"):
+            return
+        for child in self._quick_scene_buttons_frame.winfo_children():
+            child.destroy()
+        self._quick_scene_buttons = {}
+
+        templates = self._current_prompt_templates()
+        count = 0
+        for scene in templates.keys():
+            btn = tk.Button(
+                self._quick_scene_buttons_frame,
+                text=scene,
+                relief=tk.SOLID,
+                bd=1,
+                padx=4,
+                pady=1,
+                font=("Segoe UI", 8),
+                command=lambda s=scene: self._select_ai_scene(s),
+            )
+            btn.pack(side=tk.LEFT, padx=(0, 3))
+            self._quick_scene_buttons[scene] = btn
+            count += 1
+            if count >= 6:
+                break
+        self._refresh_quick_scene_button_styles()
+
+    def _refresh_quick_scene_button_styles(self):
+        if not hasattr(self, "_quick_scene_buttons"):
+            return
+        selected = (self.ai_prompt_scene_var.get() or "").strip()
+        for scene, btn in self._quick_scene_buttons.items():
+            active = scene == selected
+            btn.config(
+                bg="#1976D2" if active else "#F0F0F0",
+                fg="white" if active else "#222222",
+            )
+
+    def _toggle_stt_from_quick_panel(self):
+        if self.stt_thread and self.stt_thread.is_alive():
+            self.stop_stt_thread()
+        else:
+            self.start_stt_thread()
+
+    def show_quick_panel(self):
+        if not self._quick_panel:
+            return
+        self._quick_panel.deiconify()
+        self._quick_panel.lift()
+        self._quick_panel.attributes("-topmost", True)
+        self._sync_quick_panel_toggle_button()
+
+    def _sync_quick_panel_toggle_button(self):
+        if not hasattr(self, "quick_panel_toggle_button"):
+            return
+        visible = bool(self._quick_panel and self._quick_panel.winfo_viewable())
+        if visible:
+            self.quick_panel_toggle_button.config(bg="#1976D2", fg="white")
+        else:
+            self.quick_panel_toggle_button.config(bg="#F0F0F0", fg="#222222")
+
+    def toggle_quick_panel(self):
+        if not self._quick_panel:
+            return
+        visible = bool(self._quick_panel.winfo_viewable())
+        if visible:
+            self._quick_panel.withdraw()
+        else:
+            self._quick_panel.deiconify()
+            self._quick_panel.lift()
+            self._quick_panel.attributes("-topmost", True)
+        self._sync_quick_panel_toggle_button()
+
+    def _sync_quick_panel_buttons(self):
+        if not self._quick_panel:
+            return
+        if self._quick_toggle_stt_button:
+            stt_running = bool(
+                self.stt_thread
+                and self.stt_thread.is_alive()
+                and not self._stt_stopping_requested
+            )
+            self._quick_toggle_stt_button.config(text="停止" if stt_running else "启动")
+        if hasattr(self, "_quick_stt_dot") and self._quick_stt_dot:
+            self._quick_stt_dot.config(fg="#2E7D32" if stt_running else "#CCCCCC")
+        if self._quick_segment_button:
+            self._quick_segment_button.config(
+                text="片段结束" if self._manual_segment_active else "片段开始"
+            )
+
+    def _build_ai_tab(self, config):
+        f = self._ai_frame
+        f.columnconfigure(0, weight=1)
+        f.rowconfigure(2, weight=1)
+
+        input_lf = ttk.LabelFrame(f, text="AI 输入", padding=(8, 6, 8, 6))
+        input_lf.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 4))
+        input_lf.columnconfigure(0, weight=1)
+        input_lf.rowconfigure(0, weight=1)
+
+        self.ai_prompt_text = scrolledtext.ScrolledText(
+            input_lf, wrap=tk.WORD,
+            font=("Consolas", 9), relief=tk.FLAT, bd=0,
+            highlightthickness=1, highlightbackground="#CCCCCC",
+            height=8)
+        self.ai_prompt_text.grid(row=0, column=0, sticky="nsew")
+
+        ai_ctrl = ttk.Frame(input_lf)
+        ai_ctrl.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        ai_ctrl.columnconfigure(3, weight=1)
+        ttk.Label(ai_ctrl, text="提示词:").grid(row=0, column=0, sticky="w")
+        self.ai_prompt_scene_var = tk.StringVar(
+            value=config.get("ai_prompt_scene", "阅读")
+        )
+        self.ai_scene_buttons_frame = ttk.Frame(ai_ctrl)
+        self.ai_scene_buttons_frame.grid(row=0, column=1, sticky="w", padx=(6, 10))
+        self._ai_scene_buttons = {}
+        self._render_ai_scene_buttons()
+        ttk.Button(ai_ctrl, text="粘贴图片", command=self.paste_ai_image).grid(
+            row=0, column=2, sticky="w")
+        self.ai_image_info_var = tk.StringVar(value="未附加图片")
+        ttk.Label(ai_ctrl, textvariable=self.ai_image_info_var).grid(
+            row=0, column=3, sticky="w", padx=(8, 0))
+        ttk.Button(ai_ctrl, text="清空图片", command=self.clear_ai_image).grid(
+            row=0, column=4, sticky="e", padx=(8, 0))
+        self.ai_send_button = ttk.Button(
+            ai_ctrl, text="发送到 AI", style="Primary.TButton",
+            command=self.send_ai_request)
+        self.ai_send_button.grid(row=0, column=5, sticky="e", padx=(8, 0))
+
+        preview_lf = ttk.LabelFrame(f, text="图片预览", padding=(8, 6, 8, 6))
+        preview_lf.grid(row=1, column=0, sticky="ew", padx=8, pady=4)
+        preview_lf.columnconfigure(0, weight=1)
+        self.ai_image_preview = ttk.Label(
+            preview_lf, text="(可选) 点击“粘贴图片”从剪贴板读取图片")
+        self.ai_image_preview.grid(row=0, column=0, sticky="w")
+
+        output_lf = ttk.LabelFrame(f, text="AI 返回结果", padding=(8, 6, 8, 6))
+        output_lf.grid(row=2, column=0, sticky="nsew", padx=8, pady=(4, 8))
+        output_lf.columnconfigure(0, weight=1)
+        output_lf.rowconfigure(0, weight=1)
+        self.ai_result_text = scrolledtext.ScrolledText(
+            output_lf, wrap=tk.WORD, state=tk.DISABLED,
+            font=("Consolas", 9), relief=tk.FLAT, bd=0,
+            highlightthickness=1, highlightbackground="#CCCCCC")
+        self.ai_result_text.grid(row=0, column=0, sticky="nsew")
 
     # ──────────────────────────── Settings Tab ────────────────────────────
 
@@ -520,6 +807,72 @@ class SocketClientGUI:
         self.stt_phrase_list_entry.grid(row=8, column=3, sticky="ew", pady=3)
         self.stt_phrase_list_entry.insert(0, config.get("stt_phrase_list", ""))
 
+        # ── AI ──
+        ai = ttk.LabelFrame(inner, text="AI 配置（豆包）", padding=10)
+        ai.grid(row=r, column=0, sticky="ew", pady=(0, 10))
+        ai.columnconfigure(1, weight=1)
+        r += 1
+
+        ttk.Label(ai, text="Base URL:").grid(
+            row=0, column=0, sticky="w", pady=3, padx=(0, 8))
+        self.ai_base_url_entry = ttk.Entry(ai, width=64)
+        self.ai_base_url_entry.grid(row=0, column=1, sticky="ew", pady=3)
+        self.ai_base_url_entry.insert(
+            0, config.get("ai_base_url", "https://ark.cn-beijing.volces.com/api/v3/chat/completions")
+        )
+
+        ttk.Label(ai, text="API Key:").grid(
+            row=1, column=0, sticky="w", pady=3, padx=(0, 8))
+        self.ai_api_key_entry = ttk.Entry(ai, width=64, show="*")
+        self.ai_api_key_entry.grid(row=1, column=1, sticky="ew", pady=3)
+        self.ai_api_key_entry.insert(0, config.get("ai_api_key", ""))
+
+        ttk.Label(ai, text="模型:").grid(
+            row=2, column=0, sticky="w", pady=3, padx=(0, 8))
+        self.ai_model_var = tk.StringVar(
+            value=config.get("ai_model", "doubao-seed-2-0-lite-260215")
+        )
+        ai_model_cb = ttk.Combobox(
+            ai,
+            textvariable=self.ai_model_var,
+            values=[
+                "doubao-seed-2-0-lite-260215",
+                "doubao-seed-2-0-mini-260215",
+                "doubao-seed-2-0-pro-260215",
+            ],
+            state="readonly",
+            width=40,
+        )
+        ai_model_cb.grid(row=2, column=1, sticky="w", pady=3)
+        ai_model_cb.bind("<<ComboboxSelected>>", lambda _: self.save_config())
+
+        prompts = ttk.LabelFrame(inner, text="AI 提示词模板（长文本，可扩展按钮）", padding=10)
+        prompts.grid(row=r, column=0, sticky="ew", pady=(0, 10))
+        prompts.columnconfigure(0, weight=1)
+        r += 1
+        ttk.Label(
+            prompts,
+            text="可编辑 JSON（键=按钮名，值=模板文本）。示例：{\"阅读\":\"...\",\"听力\":\"...\"}",
+            foreground="#666666",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 4))
+        self.ai_prompt_templates_text = scrolledtext.ScrolledText(
+            prompts,
+            wrap=tk.WORD,
+            height=14,
+            font=("Consolas", 9),
+            relief=tk.FLAT,
+            bd=0,
+            highlightthickness=1,
+            highlightbackground="#CCCCCC",
+        )
+        self.ai_prompt_templates_text.grid(row=1, column=0, sticky="ew")
+        templates_json = json.dumps(
+            config.get("ai_prompt_templates", self._default_prompt_templates()),
+            ensure_ascii=False,
+            indent=2,
+        )
+        self.ai_prompt_templates_text.insert(1.0, templates_json)
+
         # Hint
         ttk.Label(
             inner,
@@ -535,6 +888,7 @@ class SocketClientGUI:
         ttk.Button(inner, text="保存所有设置", command=self.save_config,
                    style="Primary.TButton").grid(
             row=r, column=0, sticky="e", pady=4)
+        self._render_ai_scene_buttons()
 
     # ──────────────────────────── Connection state helpers ────────────────────────────
 
@@ -547,6 +901,97 @@ class SocketClientGUI:
             self._conn_label.config(text="未连接", foreground="#C62828")
 
     # ──────────────────────────── Config ────────────────────────────
+
+    def _default_prompt_templates(self):
+        return {
+            "阅读": "请以阅读理解老师身份，提炼关键信息，给出简要讲解与答题建议。",
+            "听力": "请以听力教练身份，先总结主旨，再给关键词、易错点和跟读建议。",
+            "口语": "请以口语考官身份，给出表达改进、地道替换和可直接跟读的示例回答。",
+            "写作": "请以写作老师身份，先批改语法和逻辑，再给优化版本与可复用句型。",
+        }
+
+    def _parse_prompt_templates(self, raw_text):
+        text = (raw_text or "").strip()
+        if not text:
+            return self._default_prompt_templates()
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError("提示词模板必须是 JSON 对象")
+        cleaned = {}
+        for key, value in data.items():
+            k = str(key).strip()
+            if not k:
+                continue
+            cleaned[k] = str(value or "").strip()
+        if not cleaned:
+            raise ValueError("提示词模板不能为空")
+        return cleaned
+
+    def _current_prompt_templates(self):
+        if hasattr(self, "ai_prompt_templates_text"):
+            raw = self.ai_prompt_templates_text.get(1.0, tk.END)
+            try:
+                return self._parse_prompt_templates(raw)
+            except Exception:
+                pass
+        return self._default_prompt_templates()
+
+    def _render_ai_scene_buttons(self):
+        if not hasattr(self, "ai_scene_buttons_frame"):
+            return
+        for child in self.ai_scene_buttons_frame.winfo_children():
+            child.destroy()
+        self._ai_scene_buttons = {}
+
+        templates = self._current_prompt_templates()
+        col = 0
+        selected = self.ai_prompt_scene_var.get().strip()
+        if selected and selected not in templates:
+            self.ai_prompt_scene_var.set("")
+            selected = ""
+
+        for scene in templates.keys():
+            btn = tk.Button(
+                self.ai_scene_buttons_frame,
+                text=scene,
+                relief=tk.SOLID,
+                bd=1,
+                padx=8,
+                pady=2,
+                command=lambda s=scene: self._select_ai_scene(s),
+            )
+            btn.grid(row=0, column=col, padx=(0, 4))
+            self._ai_scene_buttons[scene] = btn
+            col += 1
+
+        none_btn = tk.Button(
+            self.ai_scene_buttons_frame,
+            text="无",
+            relief=tk.SOLID,
+            bd=1,
+            padx=8,
+            pady=2,
+            command=lambda: self._select_ai_scene(""),
+        )
+        none_btn.grid(row=0, column=col)
+        self._ai_scene_buttons[""] = none_btn
+        self._refresh_ai_scene_button_styles()
+
+    def _select_ai_scene(self, scene):
+        self.ai_prompt_scene_var.set(scene)
+        self._refresh_ai_scene_button_styles()
+        self.save_config()
+
+    def _refresh_ai_scene_button_styles(self):
+        selected = self.ai_prompt_scene_var.get().strip()
+        for scene, btn in self._ai_scene_buttons.items():
+            key = scene.strip()
+            active = (key == selected) if key else (selected == "")
+            if active:
+                btn.config(bg="#1976D2", fg="white")
+            else:
+                btn.config(bg="#F0F0F0", fg="#222222")
+        self._refresh_quick_scene_button_styles()
 
     def load_config(self):
         default = {
@@ -573,6 +1018,11 @@ class SocketClientGUI:
             "stt_segmentation_strategy": "Default",
             "stt_phrase_list": "",
             "stt_send_final_to_socket": False,
+            "ai_base_url": "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+            "ai_api_key": "",
+            "ai_model": "doubao-seed-2-0-lite-260215",
+            "ai_prompt_scene": "阅读",
+            "ai_prompt_templates": self._default_prompt_templates(),
         }
         if os.path.exists(self.config_file):
             try:
@@ -620,16 +1070,31 @@ class SocketClientGUI:
 
     def save_config(self, config=None):
         if config is None:
+            prompt_templates = self._default_prompt_templates()
+            try:
+                prompt_templates = self._parse_prompt_templates(
+                    self.ai_prompt_templates_text.get(1.0, tk.END)
+                )
+            except Exception as e:
+                self.update_status(f"提示词模板 JSON 无效，已使用上次有效配置: {e}")
             config = {
                 "host": self.host_entry.get().strip(),
                 "port": self.port_entry.get().strip(),
                 "encoding": self.encoding_var.get(),
                 "clipboard_monitor": self.clipboard_monitor_var.get(),
                 **self.get_stt_settings(),
+                "ai_base_url": self.ai_base_url_entry.get().strip(),
+                "ai_api_key": self.ai_api_key_entry.get().strip(),
+                "ai_model": self.ai_model_var.get().strip()
+                or "doubao-seed-2-0-lite-260215",
+                "ai_prompt_scene": self.ai_prompt_scene_var.get().strip(),
+                "ai_prompt_templates": prompt_templates,
             }
         try:
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(config, f, indent=4, ensure_ascii=False)
+            self._render_ai_scene_buttons()
+            self._render_quick_scene_buttons()
             self.update_status("设置已保存。")
         except Exception as e:
             self.master.after(
@@ -667,6 +1132,13 @@ class SocketClientGUI:
     def clear_subtitle_area(self):
         self._subtitle_history = []
         self._subtitle_live_line = ""
+        self._subtitle_final_events = []
+        self._manual_segment_active = False
+        self._manual_segment_start_index = 0
+        self._manual_segment_start_time = None
+        if hasattr(self, "manual_segment_button"):
+            self.manual_segment_button.config(text="片段开始")
+        self._sync_quick_panel_buttons()
         self._render_subtitle_area()
 
     def _render_subtitle_area(self):
@@ -716,12 +1188,248 @@ class SocketClientGUI:
         if final:
             self._subtitle_live_line = ""
             self._subtitle_history.append(line)
+            self._subtitle_final_events.append({
+                "text": self._extract_stt_text(payload),
+                "timestamp": datetime.datetime.now(),
+            })
             if len(self._subtitle_history) > self._subtitle_max_lines:
                 self._subtitle_history = self._subtitle_history[-self._subtitle_max_lines:]
         else:
             self._subtitle_live_line = line
 
         self._render_subtitle_area()
+
+    def toggle_manual_segment(self):
+        if not self._manual_segment_active:
+            self._manual_segment_active = True
+            self._manual_segment_start_index = len(self._subtitle_final_events)
+            self._manual_segment_start_time = datetime.datetime.now()
+            self.manual_segment_button.config(text="片段结束")
+            self._sync_quick_panel_buttons()
+            self.update_status("手动片段已开始，等待结束。")
+            return
+
+        self._manual_segment_active = False
+        self.manual_segment_button.config(text="片段开始")
+        self._sync_quick_panel_buttons()
+        end_time = datetime.datetime.now()
+        segment_events = self._subtitle_final_events[self._manual_segment_start_index:]
+        segment_text = " ".join(
+            event["text"].strip() for event in segment_events if event["text"].strip()
+        ).strip()
+
+        if not segment_text:
+            self.update_status("手动片段结束：该时间段内没有最终字幕。")
+            return
+
+        start_time = self._manual_segment_start_time or end_time
+        self.ai_prompt_text.delete(1.0, tk.END)
+        self.ai_prompt_text.insert(
+            1.0,
+            segment_text,
+        )
+        self._manual_segment_pending_send = True
+        self.update_status(
+            "手动片段结束：已拼接 %d 条字幕，已填入 AI 输入框，等待粘贴图片后自动发送。"
+            % len(segment_events)
+        )
+        self._last_manual_segment_meta = {
+            "start": start_time.strftime("%H:%M:%S"),
+            "end": end_time.strftime("%H:%M:%S"),
+        }
+
+    def append_ai_result(self, text):
+        self.ai_result_text.config(state=tk.NORMAL)
+        self.ai_result_text.insert(tk.END, text.rstrip() + "\n\n")
+        self.ai_result_text.see(tk.END)
+        self.ai_result_text.config(state=tk.DISABLED)
+
+    def _get_selected_prompt_template(self):
+        scene = (self.ai_prompt_scene_var.get() or "").strip()
+        if not scene:
+            return ""
+        templates = self._current_prompt_templates()
+        return (templates.get(scene) or "").strip()
+
+    def _combine_prompt_with_template(self, user_prompt):
+        template = self._get_selected_prompt_template()
+        if not template:
+            return user_prompt.strip()
+        if not user_prompt.strip():
+            return template
+        return f"{template}\n\n用户输入：\n{user_prompt.strip()}"
+
+    def _forward_ai_result_to_socket(self, text):
+        if not text:
+            return False
+        if not self.is_connected or not self.client_socket:
+            self.update_status("AI 返回未转发：当前未连接 Socket。")
+            return False
+        sent = self._send_text_payload(
+            text,
+            source_label="AI",
+            clear_input=False,
+            show_dialog=False,
+        )
+        if sent:
+            self.update_status("AI 返回已自动转发到 Socket。")
+        return sent
+
+    def clear_ai_image(self):
+        self._ai_clipboard_image_bytes = None
+        self._ai_clipboard_image_mime = ""
+        self._ai_preview_photo = None
+        self.ai_image_info_var.set("未附加图片")
+        self.ai_image_preview.config(text="(可选) 点击“粘贴图片”从剪贴板读取图片", image="")
+
+    def paste_ai_image(self):
+        if ImageGrab is None:
+            self.update_status("未安装 Pillow，无法读取剪贴板图片。请先安装 pillow。")
+            return
+        try:
+            clip_obj = ImageGrab.grabclipboard()
+        except Exception as e:
+            self.update_status(f"读取剪贴板图片失败: {e}")
+            return
+
+        if clip_obj is None:
+            self.update_status("剪贴板中没有图片。")
+            return
+
+        image = None
+        if Image is not None and isinstance(clip_obj, Image.Image):
+            image = clip_obj
+        elif isinstance(clip_obj, list) and clip_obj:
+            # 某些系统会返回文件路径列表
+            try:
+                image = Image.open(clip_obj[0]) if Image is not None else None
+            except Exception:
+                image = None
+
+        if image is None:
+            self.update_status("剪贴板内容不是可识别图片。")
+            return
+
+        try:
+            buf = io.BytesIO()
+            image.save(buf, format="PNG")
+            self._ai_clipboard_image_bytes = buf.getvalue()
+            self._ai_clipboard_image_mime = "image/png"
+            self.ai_image_info_var.set(
+                f"已附加图片: {image.size[0]}x{image.size[1]} (PNG)"
+            )
+
+            if ImageTk is not None:
+                preview = image.copy()
+                preview.thumbnail((360, 180))
+                self._ai_preview_photo = ImageTk.PhotoImage(preview)
+                self.ai_image_preview.config(image=self._ai_preview_photo, text="")
+            else:
+                self.ai_image_preview.config(
+                    text=f"图片已附加 ({image.size[0]}x{image.size[1]})", image=""
+                )
+            self.update_status("已从剪贴板附加图片到 AI 请求。")
+            if self._manual_segment_pending_send:
+                self._manual_segment_pending_send = False
+                meta = self._last_manual_segment_meta
+                self.send_ai_request(
+                    request_source="手动片段",
+                    segment_meta=meta,
+                )
+            else:
+                self.send_ai_request(request_source="粘贴图片")
+        except Exception as e:
+            self.update_status(f"处理图片失败: {e}")
+
+    def send_ai_request(self, prompt=None, request_source="AI页面", segment_meta=None):
+        if self._ai_request_thread and self._ai_request_thread.is_alive():
+            self.update_status("AI 请求仍在处理中，请稍后。")
+            return
+
+        if prompt is None:
+            prompt = self.ai_prompt_text.get(1.0, tk.END).strip()
+        prompt = self._combine_prompt_with_template(prompt)
+        if not prompt and not self._ai_clipboard_image_bytes:
+            self.update_status("AI 输入为空，请输入文本或粘贴图片。")
+            return
+
+        api_key = self.ai_api_key_entry.get().strip()
+        base_url = self.ai_base_url_entry.get().strip()
+        model = self.ai_model_var.get().strip()
+        if not api_key or not base_url or not model:
+            self.update_status("AI 配置不完整：请在设置页填写 Base URL / API Key / 模型。")
+            return
+
+        self.save_config()
+        self.ai_send_button.config(state=tk.DISABLED)
+        self.update_status(f"{request_source} -> AI: 请求已提交，模型 {model}")
+
+        payload = {
+            "model": model,
+            "messages": [],
+            "temperature": 0.3,
+        }
+        if self._ai_clipboard_image_bytes:
+            content_items = []
+            if prompt:
+                content_items.append({"type": "text", "text": prompt})
+            img_b64 = base64.b64encode(self._ai_clipboard_image_bytes).decode("ascii")
+            data_url = f"data:{self._ai_clipboard_image_mime};base64,{img_b64}"
+            content_items.append({"type": "image_url", "image_url": {"url": data_url}})
+            payload["messages"].append({"role": "user", "content": content_items})
+        else:
+            payload["messages"].append({"role": "user", "content": prompt})
+
+        def _worker():
+            req = urllib.request.Request(
+                url=base_url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    raw = resp.read().decode("utf-8")
+                parsed = json.loads(raw)
+                answer = ""
+                choices = parsed.get("choices") or []
+                if choices:
+                    msg = choices[0].get("message") or {}
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        answer = content.strip()
+                    elif isinstance(content, list):
+                        answer = "\n".join(
+                            item.get("text", "").strip()
+                            for item in content
+                            if isinstance(item, dict) and item.get("text")
+                        ).strip()
+                if not answer:
+                    answer = json.dumps(parsed, ensure_ascii=False, indent=2)
+
+                title = f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {request_source}"
+                if segment_meta:
+                    title += f" ({segment_meta.get('start')}~{segment_meta.get('end')})"
+                final_text = f"{title}\n{answer}"
+                self.master.after(0, lambda: self.append_ai_result(final_text))
+                self.master.after(0, lambda: self.update_status("AI 返回完成。"))
+                self.master.after(0, lambda: self._forward_ai_result_to_socket(answer))
+            except urllib.error.HTTPError as e:
+                try:
+                    err = e.read().decode("utf-8", errors="replace")
+                except Exception:
+                    err = str(e)
+                self.master.after(0, lambda: self.update_status(f"AI 请求失败: HTTP {e.code} {err}"))
+            except Exception as e:
+                self.master.after(0, lambda: self.update_status(f"AI 请求异常: {e}"))
+            finally:
+                self.master.after(0, lambda: self.ai_send_button.config(state=tk.NORMAL))
+
+        self._ai_request_thread = threading.Thread(target=_worker, daemon=True)
+        self._ai_request_thread.start()
 
     # ──────────────────────────── Connection ────────────────────────────
 
@@ -888,9 +1596,8 @@ class SocketClientGUI:
         )
 
     def _normalize_plain_text_message(self, message):
-        return (message or "").replace("\r\n", "\n").replace("\r", "\n").replace(
-            "\n", "\\n"
-        )
+        # Keep real newlines so code blocks remain readable end-to-end.
+        return (message or "").replace("\r\n", "\n").replace("\r", "\n")
 
     def _send_socket_bytes(self, data, show_dialog=True):
         if not self.is_connected or not self.client_socket:
@@ -1212,8 +1919,10 @@ class SocketClientGUI:
 
     def start_stt_thread(self):
         self.on_stt_config_change()
+        self._stt_stopping_requested = False
         if self.stt_thread and self.stt_thread.is_alive():
             self.update_status("实时字幕已在运行中。")
+            self._sync_quick_panel_buttons()
             return
         if not self.stt_enabled_var.get():
             self.update_status('请先在「设置」中勾选"启用实时字幕"。')
@@ -1237,16 +1946,21 @@ class SocketClientGUI:
         self.stt_start_button.config(state=tk.DISABLED)
         self.stt_stop_button.config(state=tk.NORMAL)
         self._stt_dot.config(foreground="#2E7D32")
+        self._sync_quick_panel_buttons()
         self.update_status("正在启动实时字幕线程...")
 
     def stop_stt_thread(self):
         if self.stt_thread and self.stt_thread.is_alive():
             self.stt_stop_event.set()
+            self._stt_stopping_requested = True
+            self._sync_quick_panel_buttons()
             self.update_status("正在停止实时字幕线程...")
         else:
+            self._stt_stopping_requested = False
             self.stt_start_button.config(state=tk.NORMAL)
             self.stt_stop_button.config(state=tk.DISABLED)
             self._stt_dot.config(foreground="#CCCCCC")
+            self._sync_quick_panel_buttons()
 
     def process_stt_events(self):
         try:
@@ -1262,9 +1976,12 @@ class SocketClientGUI:
                     self.update_status(payload)
                 elif event_type == "stopped":
                     self._forward_caption_clear()
+                    self._stt_stopping_requested = False
+                    self.stt_thread = None
                     self.stt_start_button.config(state=tk.NORMAL)
                     self.stt_stop_button.config(state=tk.DISABLED)
                     self._stt_dot.config(foreground="#CCCCCC")
+                    self._sync_quick_panel_buttons()
                     self.update_status("实时字幕已停止")
         except queue.Empty:
             pass
@@ -1281,6 +1998,11 @@ class SocketClientGUI:
         self.stop_stt_thread()
         self.save_config()
         if messagebox.askokcancel("退出", "确定要退出吗？"):
+            if self._quick_panel:
+                try:
+                    self._quick_panel.destroy()
+                except Exception:
+                    pass
             self.disconnect_from_server()
             self.master.destroy()
         else:

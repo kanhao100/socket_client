@@ -26,7 +26,7 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install pyinstaller azure-cognitiveservices-speech
+        pip install pyinstaller azure-cognitiveservices-speech pillow
 
     - name: Resolve version and output name
       shell: pwsh
