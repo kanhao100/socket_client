@@ -101,14 +101,44 @@ pip install azure-cognitiveservices-speech
 python socket_client.py
 ```
 
-## 打包说明（PyInstaller）
+## 打包说明（本地）
 
-项目中的 `socket_client.spec` 和 `socket_client-v-.spec` 已添加 Azure Speech 的隐藏导入：
+推荐使用一键脚本 `build.ps1`（已内置 Azure Speech 相关收集参数）：
 
-- `azure.cognitiveservices.speech`
+```powershell
+.\build.ps1 -Version v1.0.2
+```
 
-打包前请确认已安装依赖，再执行：
+可选参数：
+
+```powershell
+.\build.ps1 -Version v1.0.2 -SkipInstall
+```
+
+说明：
+- 版本号必须以 `v` 开头（例如 `v1.0.2`）
+- 输出文件命名规则：`dist/socket_client-v1.0.2-x64.exe`（或 `x86`）
+- 脚本会自动执行 PyInstaller 并重命名产物
+
+如果本机限制执行脚本，可用：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build.ps1 -Version v1.0.2
+```
+
+## GitHub Release 工作流触发
+
+`.github/workflows/release.yml` 支持两种触发方式：
+
+1. **推送 tag 触发（自动发布）**
 
 ```bash
-pyinstaller socket_client.spec
+git tag v1.0.2
+git push origin v1.0.2
 ```
+
+2. **手动触发（workflow_dispatch）**
+- 在 GitHub Actions 页面手动运行，并填写 `version`（如 `v1.0.2`）
+
+注意：
+- 仅本地创建 tag 不会触发 Actions，必须把 tag `push` 到远端。

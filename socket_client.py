@@ -8,12 +8,16 @@ import struct
 import json
 import sys
 import queue
+import uuid
 
 from azure_realtime_stt import (
     AzureRealtimeSttConfig,
     create_realtime_stt_worker,
     is_azure_speech_sdk_available,
 )
+
+CAPTION_PROTOCOL_PREFIX = "[[SC_CAPTION_V1]]"
+TEXT_WIRE_ENCODING = "utf-8"
 
 
 class SocketClientGUI:
@@ -39,6 +43,12 @@ class SocketClientGUI:
         self._subtitle_history = []
         self._subtitle_live_line = ""
         self._subtitle_max_lines = 200
+        self._caption_stream_id = ""
+        self._caption_segment_id = ""
+        self._caption_segment_counter = 0
+        self._caption_segment_seq = 0
+        self._caption_last_partial_text = ""
+        self._caption_last_partial_lang = ""
 
         if getattr(sys, 'frozen', False) or hasattr(sys, '_MEIPASS'):
             application_path = os.path.dirname(sys.executable)
@@ -338,7 +348,7 @@ class SocketClientGUI:
         )
         ttk.Checkbutton(
             chk_row,
-            text="最终识别结果自动发送到 Socket",
+            text="字幕流式转发到 Socket",
             variable=self.stt_send_final_var,
             command=self.on_stt_config_change,
         ).pack(side=tk.LEFT)
@@ -760,6 +770,8 @@ class SocketClientGUI:
     def _on_connect_success(self):
         self.is_connected = True
         self.client_socket.settimeout(None)
+        if self.stt_thread and self.stt_thread.is_alive():
+            self._begin_caption_stream()
         self.send_button.config(state=tk.NORMAL)
         self.connect_button.config(state=tk.DISABLED)
         self.disconnect_button.config(state=tk.NORMAL)
@@ -824,6 +836,7 @@ class SocketClientGUI:
                 pass
             self.client_socket = None
         self.is_connected = False
+        self._reset_caption_protocol_state()
         self.send_button.config(state=tk.DISABLED)
         self.connect_button.config(state=tk.NORMAL)
         self.disconnect_button.config(state=tk.DISABLED)
@@ -832,34 +845,63 @@ class SocketClientGUI:
 
     # ──────────────────────────── Send ────────────────────────────
 
-    def _send_text_payload(self, message, source_label="我",
-                           clear_input=False, show_dialog=True):
+    def _reset_caption_segment_state(self):
+        self._caption_segment_id = ""
+        self._caption_segment_seq = 0
+        self._caption_last_partial_text = ""
+        self._caption_last_partial_lang = ""
+
+    def _reset_caption_protocol_state(self):
+        self._caption_stream_id = ""
+        self._caption_segment_counter = 0
+        self._reset_caption_segment_state()
+
+    def _begin_caption_stream(self):
+        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        self._caption_stream_id = f"stt-{timestamp}-{uuid.uuid4().hex[:6]}"
+        self._caption_segment_counter = 0
+        self._reset_caption_segment_state()
+
+    def _ensure_caption_stream(self):
+        if not self._caption_stream_id:
+            self._begin_caption_stream()
+        return self._caption_stream_id
+
+    def _ensure_caption_segment(self):
+        if not self._caption_segment_id:
+            self._caption_segment_counter += 1
+            self._caption_segment_id = f"seg-{self._caption_segment_counter:04d}"
+            self._caption_segment_seq = 0
+            self._caption_last_partial_text = ""
+            self._caption_last_partial_lang = ""
+        return self._caption_segment_id
+
+    def _next_caption_seq(self):
+        self._caption_segment_seq += 1
+        return self._caption_segment_seq
+
+    def _caption_forward_enabled(self):
+        return bool(
+            self.stt_send_final_var.get()
+            and self.is_connected
+            and self.client_socket
+        )
+
+    def _normalize_plain_text_message(self, message):
+        return (message or "").replace("\r\n", "\n").replace("\r", "\n").replace(
+            "\n", "\\n"
+        )
+
+    def _send_socket_bytes(self, data, show_dialog=True):
+        if not self.is_connected or not self.client_socket:
+            if show_dialog:
+                messagebox.showerror("错误", "请先连接到服务器！")
+            self.update_status("尚未连接到服务器。")
+            return False
+
         try:
-            encoding = self.encoding_var.get()
-            try:
-                encoded = message.encode(encoding)
-            except UnicodeEncodeError as e:
-                self.update_status(f"编码失败：{encoding}")
-                if show_dialog:
-                    messagebox.showerror(
-                        "编码错误",
-                        f"无法用 {encoding} 编码。\n{e}",
-                    )
-                return False
-
-            self.client_socket.sendall(encoded)
-            timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-            self.update_status(f"{source_label}消息已发送（编码: {encoding}）")
-            self.receive_text.config(state=tk.NORMAL)
-            self.receive_text.insert(
-                tk.END, f"[{timestamp}] {source_label}: {message}\n")
-            self.receive_text.see(tk.END)
-            self.receive_text.config(state=tk.DISABLED)
-
-            if clear_input:
-                self.send_text.delete(1.0, tk.END)
+            self.client_socket.sendall(data)
             return True
-
         except (BrokenPipeError, ConnectionResetError):
             self.update_status("发送失败：连接已断开。")
             if show_dialog:
@@ -873,6 +915,145 @@ class SocketClientGUI:
         except Exception as e:
             self.update_status(f"发送异常：{e}")
             return False
+
+    def _send_text_payload(self, message, source_label="我",
+                           clear_input=False, show_dialog=True):
+        wire_message = self._normalize_plain_text_message(message)
+        if not wire_message:
+            self.update_status("发送内容不能为空。")
+            return False
+        if wire_message.startswith(CAPTION_PROTOCOL_PREFIX):
+            if show_dialog:
+                messagebox.showerror(
+                    "错误",
+                    f"普通消息不能以保留前缀 {CAPTION_PROTOCOL_PREFIX} 开头。",
+                )
+            self.update_status("普通消息命中了字幕协议保留前缀，已阻止发送。")
+            return False
+
+        try:
+            encoded = f"{wire_message}\n".encode(TEXT_WIRE_ENCODING)
+        except UnicodeEncodeError as e:
+            self.update_status(f"编码失败：{TEXT_WIRE_ENCODING}")
+            if show_dialog:
+                messagebox.showerror(
+                    "编码错误",
+                    f"无法用 {TEXT_WIRE_ENCODING} 编码。\n{e}",
+                )
+            return False
+
+        if not self._send_socket_bytes(encoded, show_dialog=show_dialog):
+            return False
+
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        self.update_status(
+            f"{source_label}消息已发送（行协议: {TEXT_WIRE_ENCODING}）"
+        )
+        self.receive_text.config(state=tk.NORMAL)
+        self.receive_text.insert(
+            tk.END, f"[{timestamp}] {source_label}: {wire_message}\n")
+        self.receive_text.see(tk.END)
+        self.receive_text.config(state=tk.DISABLED)
+
+        if clear_input:
+            self.send_text.delete(1.0, tk.END)
+        return True
+
+    def _build_caption_message(self, message_type, payload=None):
+        message = {
+            "type": message_type,
+            "stream_id": self._ensure_caption_stream(),
+            "timestamp_ms": int(datetime.datetime.now().timestamp() * 1000),
+        }
+        if payload:
+            message.update(payload)
+        return message
+
+    def _send_caption_protocol_message(self, message):
+        wire_message = (
+            f"{CAPTION_PROTOCOL_PREFIX} "
+            f"{json.dumps(message, ensure_ascii=False, separators=(',', ':'))}\n"
+        )
+        encoded = wire_message.encode(TEXT_WIRE_ENCODING)
+        return self._send_socket_bytes(encoded, show_dialog=False)
+
+    def _forward_caption_partial(self, payload):
+        if not self._caption_forward_enabled():
+            return False
+
+        text = self._extract_stt_text(payload)
+        if not text:
+            return False
+
+        lang = ""
+        if isinstance(payload, dict):
+            lang = (payload.get("detected_language") or "").strip()
+
+        if (text == self._caption_last_partial_text
+                and lang == self._caption_last_partial_lang):
+            return False
+
+        message = self._build_caption_message(
+            "caption_partial",
+            {
+                "segment_id": self._ensure_caption_segment(),
+                "seq": self._next_caption_seq(),
+                "text": text,
+            },
+        )
+        if lang:
+            message["lang"] = lang
+
+        if self._send_caption_protocol_message(message):
+            self._caption_last_partial_text = text
+            self._caption_last_partial_lang = lang
+            return True
+        return False
+
+    def _forward_caption_final(self, payload):
+        text = self._extract_stt_text(payload)
+        if not text:
+            self._reset_caption_segment_state()
+            return False
+
+        sent = False
+        if self._caption_forward_enabled():
+            lang = ""
+            if isinstance(payload, dict):
+                lang = (payload.get("detected_language") or "").strip()
+
+            message = self._build_caption_message(
+                "caption_final",
+                {
+                    "segment_id": self._ensure_caption_segment(),
+                    "seq": self._next_caption_seq(),
+                    "text": text,
+                },
+            )
+            if lang:
+                message["lang"] = lang
+            sent = self._send_caption_protocol_message(message)
+
+        self._reset_caption_segment_state()
+        return sent
+
+    def _forward_caption_clear(self):
+        if not self._caption_segment_id:
+            return False
+
+        sent = False
+        if self._caption_forward_enabled():
+            message = self._build_caption_message(
+                "caption_clear",
+                {
+                    "segment_id": self._caption_segment_id,
+                    "seq": self._next_caption_seq(),
+                },
+            )
+            sent = self._send_caption_protocol_message(message)
+
+        self._reset_caption_segment_state()
+        return sent
 
     def send_message(self):
         if not self.is_connected or not self.client_socket:
@@ -1048,6 +1229,7 @@ class SocketClientGUI:
             self.update_status(f"实时字幕配置错误：{e}")
             return
 
+        self._begin_caption_stream()
         self.stt_stop_event.clear()
         worker = self.create_realtime_subtitle_worker(stt_options)
         self.stt_thread = threading.Thread(target=worker, daemon=True)
@@ -1072,22 +1254,14 @@ class SocketClientGUI:
                 event_type, payload = self.stt_queue.get_nowait()
                 if event_type == "partial":
                     self.update_subtitle_area(payload, final=False)
+                    self._forward_caption_partial(payload)
                 elif event_type == "final":
                     self.update_subtitle_area(payload, final=True)
-                    final_text = self._extract_stt_text(payload)
-                    if (self.stt_send_final_var.get()
-                            and self.is_connected
-                            and self.client_socket
-                            and final_text):
-                        self._send_text_payload(
-                            final_text,
-                            source_label="字幕",
-                            clear_input=False,
-                            show_dialog=False,
-                        )
+                    self._forward_caption_final(payload)
                 elif event_type == "status":
                     self.update_status(payload)
                 elif event_type == "stopped":
+                    self._forward_caption_clear()
                     self.stt_start_button.config(state=tk.NORMAL)
                     self.stt_stop_button.config(state=tk.DISABLED)
                     self._stt_dot.config(foreground="#CCCCCC")
