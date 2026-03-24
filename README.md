@@ -11,6 +11,7 @@
 - 清空接收和状态区域
 - 使用 `Ctrl+Enter` 快捷键发送消息
 - **粘贴板监听**：勾选"监听粘贴板"开关后，自动将复制的文本内容填入发送文本框（仅处理文本，忽略图片和文件）
+- **实时字幕（新增）**：在独立线程中进行语音识别，主线程实时显示字幕，避免界面卡顿
 
 ### 编码支持
 - **多种编码格式支持**：UTF-8、GBK、GB2312、ASCII、Latin-1
@@ -29,6 +30,21 @@
 - **进度显示**：实时显示文件发送进度
 - **文件大小限制**：默认10MB上限，超出时给出警告提示
 - **支持的文件类型**：所有文件类型（二进制安全传输）
+
+### 实时字幕（Azure Speech）
+- **线程隔离**：语音识别运行在后台线程，识别结果通过线程安全队列回传主线程
+- **实时显示**：区分“识别中”和“最终”字幕
+- **可配置项**（自动写入 `config.json`）：
+  - 启用字幕
+  - 识别语言（默认 `zh-CN`）
+  - Region（默认 `southeastasia`）
+  - Endpoint（可选）
+  - 订阅 Key（可选，可用环境变量替代）
+  - 最终字幕自动发送到 Socket（可选）
+- **环境变量兼容**：
+  - `AZURE_SPEECH_KEY`
+  - `AZURE_SPEECH_REGION`
+  - `AZURE_SPEECH_ENDPOINT`
 
 ### 错误处理
 - **连接错误处理**：连接超时、拒绝连接、网络错误等
@@ -66,10 +82,27 @@
 
 - Python 3.6+
 - Tkinter（通常随Python一起安装）
-- 标准库：socket, threading, datetime, os, struct
+- 标准库：socket, threading, datetime, os, struct, queue
+- Azure Speech SDK（实时字幕功能需要）：
+
+```bash
+pip install azure-cognitiveservices-speech
+```
 
 ## 如何运行
 
 ```bash
 python socket_client.py
+```
+
+## 打包说明（PyInstaller）
+
+项目中的 `socket_client.spec` 和 `socket_client-v-.spec` 已添加 Azure Speech 的隐藏导入：
+
+- `azure.cognitiveservices.speech`
+
+打包前请确认已安装依赖，再执行：
+
+```bash
+pyinstaller socket_client.spec
 ```

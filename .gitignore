@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build / package artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+
+# PyInstaller
+*.manifest
+*.spec.bak
+
+# Logs / temp
+*.log
+*.tmp
+*.temp
+
+# Local runtime config / secrets
+config.json
+.env
+.env.*
+
+# IDE
+.idea/
+.vscode/

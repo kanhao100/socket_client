@@ -2,5 +2,11 @@
     "host": "127.0.0.1",
     "port": "8888",
     "encoding": "utf-8",
-    "clipboard_monitor": true
+    "clipboard_monitor": true,
+    "stt_enabled": true,
+    "stt_language": "en-US",
+    "stt_region": "southeastasia",
+    "stt_endpoint": "",
+    "stt_key": "",
+    "stt_send_final_to_socket": false
 }
