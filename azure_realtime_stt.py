@@ -7,8 +7,10 @@ from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Tuple
 
 try:
     import azure.cognitiveservices.speech as speechsdk
-except Exception:
+    _SPEECHSDK_IMPORT_ERROR = ""
+except Exception as exc:
     speechsdk = None
+    _SPEECHSDK_IMPORT_ERROR = str(exc)
 
 
 SttEventEmitter = Callable[[str, Any], None]
@@ -421,8 +423,12 @@ def _build_runtime_summary(config: AzureRealtimeSttConfig) -> str:
 
 def _ensure_sdk() -> None:
     if speechsdk is None:
+        detail = _SPEECHSDK_IMPORT_ERROR.strip()
+        if detail:
+            detail = f"（导入错误：{detail}）"
         raise RuntimeError(
-            "未安装 azure-cognitiveservices-speech，无法启动实时字幕。"
+            "未安装或无法加载 azure-cognitiveservices-speech，无法启动实时字幕。"
+            + detail
         )
 
 

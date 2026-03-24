@@ -1,12 +1,19 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_all
+
+datas = []
+binaries = []
+hiddenimports = ['azure.cognitiveservices.speech']
+tmp_ret = collect_all('azure.cognitiveservices.speech')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
     ['socket_client.py'],
     pathex=[],
-    binaries=[],
-    datas=[],
-    hiddenimports=['azure.cognitiveservices.speech'],
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
